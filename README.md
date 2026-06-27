@@ -1,5 +1,7 @@
 # PAR-tropical-reconstruction
 
+[![DOI](https://zenodo.org/badge/1282126246.svg)](https://doi.org/10.5281/zenodo.20963724)
+
 Reproducible code and data for PAR (Photosynthetically Active Radiation) reconstruction at a humid tropical coastal site.
 
 ## Repository contents
