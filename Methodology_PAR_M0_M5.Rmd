@@ -1,0 +1,491 @@
+---
+title: "Reconstruction and Improvement of Satellite PAR at a Humid Tropical Coastal Site"
+subtitle: "Reproducible methodology: models M0–M5 and statistical validation analyses"
+author: "Muñoz-Salcedo, M.; López Hidalgo, M. A.; Ortíz-Mata, J.; Peci-López, F."
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+  pdf_document:
+    toc: true
+    number_sections: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 5, fig.align = "center"
+)
+set.seed(42)
+```
+
+# Workflow overview
+
+This document reproduces, step by step, the site-adaptation methodology applied to validate,
+reconstruct, and improve satellite-derived Photosynthetically Active Radiation (PAR) at a humid
+tropical coastal site (Milagro, Ecuador). The study is organized into five phases:
+
+1. **Data acquisition and quality control** of in situ and satellite data (PAR > 30 filter).
+2. **Validation** of the reference satellite product (CERES) against in situ measurements.
+3. **Construction and benchmarking** of six model configurations (M0–M5).
+4. **Statistical checks**: multicollinearity (VIF, bootstrap), robustness via regularization
+   (Ridge, LASSO, PCR), out-of-sample cross-validation, and quantification of distributional
+   artifacts (MASD).
+5. **Annual reconstruction** and accumulated-energy accounting.
+
+> **Note on the data.** Continuous in situ measurements are available only for July–December 2024
+> (the measured period). The January–June series is a **model-based reconstruction**, not an
+> independent measurement. Accordingly, every skill metric is computed by internal
+> cross-validation over the measured period.
+
+---
+
+# Packages and configuration
+
+```{r packages}
+# install.packages(c("tidyverse","readxl","glmnet","pls","car","Metrics","transport","lubridate"))
+library(tidyverse)   # data manipulation and plotting
+library(readxl)      # Excel reading
+library(lubridate)   # dates
+library(glmnet)      # Ridge and LASSO
+library(pls)         # principal component regression (PCR)
+library(car)         # VIF
+library(Metrics)     # RMSE, etc. (optional)
+library(transport)   # Wasserstein distance (optional, for artifacts)
+```
+
+# Data loading and quality control (Phase 1)
+
+```{r load-qc}
+# Input file (sheet with all hourly variables for 2024)
+path <- "PAR_NSRDB2024_Satellite_par_reconstructed_.xlsx"
+df <- read_excel(path)
+
+# Physical predictors of the multivariate model
+predictors <- c("GHI", "cosz", "Cloud Type", "Aerosol Optical Depth",
+                "Precipitable Water", "Temperature", "Relative Humidity")
+
+# --- Daylight filter: PAR_insitu > 30 umol m-2 s-1 ---
+# Removes nighttime and deep twilight hours; applied consistently to ALL
+# variables (the same rows are retained throughout).
+d <- df %>%
+  filter(PAR_insitu > 30) %>%
+  drop_na(all_of(c("PAR_insitu", "PAR_sat", predictors, "Month", "Hour", "Kt_calc")))
+
+# Time stamp and time-of-day classification (local solar time)
+d <- d %>%
+  mutate(
+    date = make_date(Year, Month, Day),
+    tod = case_when(
+      Hour >= 7  & Hour <= 9  ~ "Morning",
+      Hour >= 10 & Hour <= 12 ~ "Midday",
+      Hour >= 13 & Hour <= 16 ~ "Afternoon",
+      TRUE                    ~ "Dusk"
+    ),
+    period = if_else(Month %in% 7:12, "Measured (Jul-Dec)", "Reconstructed (Jan-Jun)")
+  )
+
+# Period masks
+is_measured      <- d$Month %in% 7:12          # genuine in situ data
+is_reconstructed <- d$Month %in% 1:6           # reconstruction target
+
+cat("Total daylight records:", nrow(d), "\n")
+cat("Measured period (Jul-Dec):", sum(is_measured), "rows,",
+    n_distinct(d$date[is_measured]), "days\n")
+cat("Reconstruction period (Jan-Jun):", sum(is_reconstructed), "rows\n")
+```
+
+```{r helper-metrics}
+# Metrics function: R2 (Pearson^2), RMSE%, MAE%, MBE%, bias%
+metrics <- function(obs, mod) {
+  obs <- as.numeric(obs); mod <- as.numeric(mod)
+  mo  <- mean(obs)
+  data.frame(
+    n        = length(obs),
+    R2       = cor(obs, mod)^2,
+    RMSE_pct = sqrt(mean((mod - obs)^2)) / mo * 100,
+    MAE_pct  = mean(abs(mod - obs)) / mo * 100,
+    MBE_pct  = mean(mod - obs) / mo * 100,
+    Bias_pct = sum(mod - obs) / sum(obs) * 100
+  )
+}
+```
+
+---
+
+# Models M0–M5
+
+The six configurations share the same goal (estimating in situ PAR) and differ in the
+information they use. Except for M0, all are fitted **using the measured period only**, and the
+predictors are standardized with the parameters of that period.
+
+```{r standardize}
+# Predictor matrix and response (full year, to predict / reconstruct)
+X_all <- as.matrix(d[, predictors])
+y_all <- d$PAR_insitu
+
+# Standardization with mean/sd from the measured period
+mu <- colMeans(X_all[is_measured, ])
+sg <- apply(X_all[is_measured, ], 2, sd)
+Xs_all <- scale(X_all, center = mu, scale = sg)
+```
+
+## M0 — Direct satellite (CERES)
+
+`M0` is the uncorrected satellite product: simply the `PAR_sat` column.
+
+```{r m0}
+pred_M0 <- d$PAR_sat
+metrics(y_all[is_measured], pred_M0[is_measured])
+```
+
+## M1 — GHI only
+
+Simple linear regression of in situ PAR on global horizontal irradiance.
+
+```{r m1}
+fit_ols <- function(cols) {
+  Xc <- scale(as.matrix(d[, cols]),
+              center = colMeans(as.matrix(d[is_measured, cols])),
+              scale  = apply(as.matrix(d[is_measured, cols]), 2, sd))
+  fit <- lm(y_all[is_measured] ~ Xc[is_measured, , drop = FALSE])
+  # prediction over the full year
+  pred <- cbind(1, Xc) %*% coef(fit)
+  list(fit = fit, pred = as.numeric(pred))
+}
+
+M1 <- fit_ols("GHI")
+metrics(y_all[is_measured], M1$pred[is_measured])
+```
+
+## M2 — GHI + cosine of the zenith angle
+
+Adds solar geometry (cosz) to M1.
+
+```{r m2}
+M2 <- fit_ols(c("GHI", "cosz"))
+metrics(y_all[is_measured], M2$pred[is_measured])
+```
+
+## M3 — Multivariate physical model (main model)
+
+Integrates the **seven** physical predictors. This is the core model of the study.
+
+```{r m3}
+fit_M3 <- lm(y_all[is_measured] ~ Xs_all[is_measured, ])
+pred_M3 <- as.numeric(cbind(1, Xs_all) %*% coef(fit_M3))
+
+# Standardized coefficients (excluding the intercept)
+coef_M3 <- coef(fit_M3)[-1]
+names(coef_M3) <- predictors
+round(coef_M3, 1)
+
+metrics(y_all[is_measured], pred_M3[is_measured])
+```
+
+## M4 — Stochastic model (M3 + residual resampling)
+
+A residual sampled **conditionally** by (month, hour, Kt decile) is added to the deterministic
+M3 prediction, which preserves the intraday and seasonal covariance structure.
+
+```{r m4}
+resid_M3 <- y_all[is_measured] - pred_M3[is_measured]
+kt <- d$Kt_calc
+# Kt deciles over the measured period
+brk <- quantile(kt[is_measured], probs = seq(0, 1, 0.1), na.rm = TRUE)
+kt_bin <- cut(kt, breaks = unique(brk), include.lowest = TRUE, labels = FALSE)
+
+key <- function(m, h, k) paste(m, h, k, sep = "_")
+resid_table <- split(resid_M3,
+                     key(d$Month[is_measured], d$Hour[is_measured], kt_bin[is_measured]))
+
+pred_M4 <- pred_M3
+for (i in seq_len(nrow(d))) {
+  k <- key(d$Month[i], d$Hour[i], kt_bin[i])
+  pool <- resid_table[[k]]
+  if (is.null(pool) || length(pool) == 0) pool <- resid_M3
+  pred_M4[i] <- pred_M3[i] + sample(pool, 1)
+}
+metrics(y_all[is_measured], pred_M4[is_measured])
+```
+
+## M5 — Quantile Mapping
+
+Transforms the M3 output so its marginal distribution matches that of the in situ observations.
+It is applied **globally** (no stratification), which is the direct cause of the "banding".
+
+```{r m5}
+quantile_map <- function(values, source, target) {
+  so <- sort(source); ta <- sort(target)
+  rk <- findInterval(values, so) / length(so)
+  rk <- pmin(pmax(rk, 1e-6), 1 - 1e-6)
+  ta[pmax(1, round(rk * (length(ta) - 1)) + 1)]
+}
+pred_M5 <- quantile_map(pred_M3, pred_M3[is_measured], y_all[is_measured])
+metrics(y_all[is_measured], pred_M5[is_measured])
+```
+
+## Comparative table M0–M5 (measured period)
+
+```{r benchmark-table}
+benchmark <- bind_rows(
+  M0 = metrics(y_all[is_measured], pred_M0[is_measured]),
+  M1 = metrics(y_all[is_measured], M1$pred[is_measured]),
+  M2 = metrics(y_all[is_measured], M2$pred[is_measured]),
+  M3 = metrics(y_all[is_measured], pred_M3[is_measured]),
+  M4 = metrics(y_all[is_measured], pred_M4[is_measured]),
+  M5 = metrics(y_all[is_measured], pred_M5[is_measured]),
+  .id = "Model"
+)
+benchmark %>% mutate(across(where(is.numeric), ~round(., 2)))
+```
+
+> **Reference values obtained in the study (out-of-sample):**
+> M0 R² ≈ 0.74 (RMSE 35.5%), M2 R² ≈ 0.81, **M3 R² ≈ 0.82 (RMSE 28.7%)**,
+> M5 R² ≈ 0.83. The annual improvement reported (R² 0.71 → 0.79) corresponds to
+> validation on the full-year set using the product columns.
+
+---
+
+# Statistical validation analyses (Phase 4)
+
+## Multicollinearity: VIF and condition number
+
+```{r vif}
+df_vif <- as.data.frame(Xs_all[is_measured, ])
+names(df_vif) <- make.names(predictors)
+vif_model <- lm(y_all[is_measured] ~ ., data = df_vif)
+vif_vals <- car::vif(vif_model)
+round(vif_vals, 1)
+
+# condition number of the standardized design matrix
+X_design <- cbind(1, Xs_all[is_measured, ])
+kappa_cond <- kappa(X_design, exact = TRUE)
+cat("Condition number:", round(kappa_cond, 1), "\n")
+```
+
+> **Study result:** VIF(Temperature) ≈ 24.3 and VIF(Relative Humidity) ≈ 23.5
+> (both > 10, confirming severe collinearity); all others < 5. Condition number ≈ 12.6.
+
+## Bootstrap confidence intervals
+
+Estimates the uncertainty of each coefficient by resampling the observations (2000 repetitions),
+without assuming normality or absence of collinearity.
+
+```{r bootstrap}
+B <- 2000
+boot_coef <- matrix(NA, nrow = B, ncol = length(predictors))
+Xm <- Xs_all[is_measured, ]; ym <- y_all[is_measured]
+n_m <- length(ym)
+for (b in seq_len(B)) {
+  s <- sample(n_m, n_m, replace = TRUE)
+  fit_b <- lm(ym[s] ~ Xm[s, ])
+  boot_coef[b, ] <- coef(fit_b)[-1]
+}
+ci <- t(apply(boot_coef, 2, quantile, probs = c(0.025, 0.975)))
+coef_table <- data.frame(
+  Predictor   = predictors,
+  Std_coef    = round(coef_M3, 1),
+  CI_lower    = round(ci[, 1], 1),
+  CI_upper    = round(ci[, 2], 1)
+)
+coef_table
+```
+
+> **Reading:** GHI and cosz have narrow intervals (stable coefficients);
+> Temperature and Relative Humidity have wide intervals (unstable coefficients),
+> consistent with their high VIF.
+
+## Robustness via regularization (Ridge, LASSO, PCR)
+
+Confirms that collinearity **does not compromise prediction**, comparing OLS with regularized
+methods using day-blocked cross-validation.
+
+```{r regularization}
+# OLS is M3. Ridge and LASSO with glmnet; PCR with pls.
+xreg <- Xs_all[is_measured, ]; yreg <- y_all[is_measured]
+
+# Ridge (alpha = 0) and LASSO (alpha = 1), lambda by CV
+cv_ridge <- cv.glmnet(xreg, yreg, alpha = 0)
+cv_lasso <- cv.glmnet(xreg, yreg, alpha = 1)
+
+pred_ridge <- as.numeric(predict(cv_ridge, xreg, s = "lambda.min"))
+pred_lasso <- as.numeric(predict(cv_lasso, xreg, s = "lambda.min"))
+
+# PCR with 5 components
+df_pcr <- data.frame(y = yreg, xreg)
+fit_pcr <- pcr(y ~ ., data = df_pcr, ncomp = 5, scale = FALSE)
+pred_pcr <- as.numeric(predict(fit_pcr, df_pcr, ncomp = 5))
+
+reg_tab <- bind_rows(
+  `OLS (M3)` = metrics(yreg, fitted(fit_M3)),
+  Ridge      = metrics(yreg, pred_ridge),
+  LASSO      = metrics(yreg, pred_lasso),
+  `PCR (5c)` = metrics(yreg, pred_pcr),
+  .id = "Method"
+)
+reg_tab %>% mutate(across(where(is.numeric), ~round(., 3)))
+```
+
+> **Study result:** OLS, Ridge, and LASSO give R² ≈ 0.824 (identical);
+> PCR ≈ 0.811. The equivalence confirms that collinearity destabilizes the
+> individual coefficients but not the ensemble prediction.
+
+## Variable-removal sensitivity
+
+```{r removal}
+remove <- list(
+  `Without Temperature`       = setdiff(predictors, "Temperature"),
+  `Without Relative Humidity` = setdiff(predictors, "Relative Humidity"),
+  `Without both`              = setdiff(predictors, c("Temperature", "Relative Humidity"))
+)
+rem_tab <- imap_dfr(remove, function(cols, name) {
+  m <- fit_ols(cols)
+  cbind(Configuration = name, metrics(y_all[is_measured], m$pred[is_measured]))
+})
+rem_tab %>% mutate(across(where(is.numeric), ~round(., 3)))
+```
+
+## Out-of-sample cross-validation
+
+### Leave-one-month-out (6 folds)
+
+```{r loo-month}
+meas_months <- 7:12
+loo <- map_dfr(meas_months, function(mo) {
+  tr <- is_measured & d$Month != mo
+  te <- is_measured & d$Month == mo
+  fit <- lm(y_all[tr] ~ Xs_all[tr, ])
+  pe  <- as.numeric(cbind(1, Xs_all[te, ]) %*% coef(fit))
+  cbind(Month = mo, metrics(y_all[te], pe))
+})
+loo %>% mutate(across(where(is.numeric), ~round(., 3)))
+cat("LOO  mean R2:", round(mean(loo$R2), 3),
+    "+/-", round(sd(loo$R2), 3),
+    "| mean RMSE%:", round(mean(loo$RMSE_pct), 1), "\n")
+```
+
+### Day-blocked (10 folds)
+
+```{r day-kfold}
+days <- unique(d$date[is_measured])
+set.seed(42)
+folds <- sample(rep(1:10, length.out = length(days)))
+fold_map <- setNames(folds, as.character(days))
+
+idx_meas <- which(is_measured)
+row_fold <- fold_map[as.character(d$date[idx_meas])]
+
+kf <- map_dfr(1:10, function(k) {
+  te_local <- which(row_fold == k)
+  tr_local <- which(row_fold != k)
+  tr <- idx_meas[tr_local]; te <- idx_meas[te_local]
+  fit <- lm(y_all[tr] ~ Xs_all[tr, ])
+  pe  <- as.numeric(cbind(1, Xs_all[te, ]) %*% coef(fit))
+  cbind(Fold = k, metrics(y_all[te], pe))
+})
+cat("Day-blocked 10-fold  mean R2:", round(mean(kf$R2), 3),
+    "| mean RMSE%:", round(mean(kf$RMSE_pct), 1), "\n")
+```
+
+> **Study result:** LOO R² = 0.829 ± 0.036 (RMSE 28.6%);
+> day-blocked R² = 0.824. Six months are sufficient to anchor the annual reconstruction.
+
+## Performance by time of day (M0 vs M3)
+
+```{r tod}
+slots <- c("Morning", "Midday", "Afternoon", "Dusk")
+tod_tab <- map_dfr(slots, function(f) {
+  sel <- is_measured & d$tod == f
+  m0 <- metrics(y_all[sel], pred_M0[sel])
+  m3 <- metrics(y_all[sel], pred_M3[sel])
+  data.frame(Slot = f,
+             M0_R2 = round(m0$R2, 3), M0_RMSE = round(m0$RMSE_pct, 1), M0_MBE = round(m0$MBE_pct, 1),
+             M3_R2 = round(m3$R2, 3), M3_RMSE = round(m3$RMSE_pct, 1), M3_MBE = round(m3$MBE_pct, 1),
+             n = m0$n)
+})
+tod_tab
+```
+
+> **Honest limitation (dusk):** M3 removes the bias (MBE from −20.8% to 2.5%)
+> but the out-of-sample RMSE can increase, because the few low-elevation points
+> carry high leverage. Flagging/excluding solar elevation < 5° is recommended.
+
+## Quantification of distributional artifacts (MASD)
+
+Measures hourly roughness: how much PAR changes, on average, from one hour to the next.
+
+```{r masd}
+masd <- function(x) mean(abs(diff(x)))
+cat("MASD M3 (measured):", round(masd(pred_M3[is_measured]), 1), "\n")
+cat("MASD M5 (measured):", round(masd(pred_M5[is_measured]), 1), "\n")
+cat("M5 rougher than M3:",
+    round(100 * (masd(pred_M5[is_measured]) - masd(pred_M3[is_measured])) /
+          masd(pred_M3[is_measured]), 1), "%\n")
+
+# Over the Jan-Jun reconstruction
+cat("MASD M3 (reconstruction):", round(masd(pred_M3[is_reconstructed]), 1), "\n")
+cat("MASD M5 (reconstruction):", round(masd(pred_M5[is_reconstructed]), 1), "\n")
+```
+
+> **Study result:** Quantile Mapping is 5.7% rougher than M3 over the measured
+> months and 10.4% rougher over the reconstruction. M3 preserves physical continuity.
+
+---
+
+# Annual reconstruction and accumulated energy (Phase 5)
+
+```{r energy}
+conv <- 3600 * 1e-6  # umol m-2 s-1 (hourly) -> mol m-2 h-1
+
+# Energy over the measured period (out-of-sample M3 vs measured vs satellite)
+e_meas <- sum(pmax(y_all[is_measured], 0) * conv)
+e_sat  <- sum(pmax(d$PAR_sat[is_measured], 0) * conv)
+e_m3   <- sum(pmax(pred_M3[is_measured], 0) * conv)
+
+cat("Measured energy (Jul-Dec):", round(e_meas, 1), "mol m-2\n")
+cat("Satellite energy         :", round(e_sat, 1),
+    " (bias", round(100*(e_sat-e_meas)/e_meas, 2), "%)\n")
+cat("M3 energy                :", round(e_m3, 1),
+    " (bias", round(100*(e_m3-e_meas)/e_meas, 2), "%)\n")
+
+# Reconstructed product Jan-Jun
+e_recon <- sum(pmax(pred_M3[is_reconstructed], 0) * conv)
+cat("Reconstructed product (Jan-Jun):", round(e_recon, 1), "mol m-2\n")
+```
+
+```{r monthly-plot, fig.cap="Monthly PAR distribution: measured vs satellite vs M3"}
+d %>%
+  mutate(M3 = pred_M3) %>%
+  group_by(Month, period) %>%
+  summarise(insitu = sum(PAR_insitu*conv),
+            sat    = sum(PAR_sat*conv),
+            m3     = sum(pmax(M3,0)*conv), .groups="drop") %>%
+  pivot_longer(c(insitu, sat, m3), names_to="series", values_to="energy") %>%
+  ggplot(aes(Month, energy, fill=series)) +
+  geom_col(position="dodge") +
+  geom_vline(xintercept = 6.5, linetype="dashed") +
+  scale_x_continuous(breaks=1:12) +
+  labs(x="Month", y=expression(Energy~(mol~m^{-2})), fill="Series",
+       title="Jan-Jun: reconstructed | Jul-Dec: measured") +
+  theme_minimal()
+```
+
+> **Study result (full-year set, product columns):**
+> in situ 11,446 / satellite 10,705 / M3 10,981 mol m⁻²; annual bias reduced by
+> 37% (from −6.5% to −4.1%).
+
+---
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
